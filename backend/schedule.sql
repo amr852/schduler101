@@ -1,12 +1,29 @@
-CREATE DATABASE scheduler_db;
-GO
+/* ================================
+   Scheduler DB – FULL SETUP
+   ================================ */
 USE scheduler_db;
 GO
-IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'app')
-    EXEC('CREATE SCHEMA app');
+
+IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'app_user')
+    CREATE USER [app_user] FOR LOGIN [app_user];
+
+ALTER ROLE db_owner ADD MEMBER [app_user];  -- for dev/testing
+
+
+-- Use DB
+USE scheduler_db;
 GO
 
+-- 0.1) Ensure schema "app" exists
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'app')
+  EXEC ('CREATE SCHEMA app AUTHORIZATION dbo;');
+GO
 
+/* ================================
+   1) TABLES
+   ================================ */
+
+-- Tenants
 IF OBJECT_ID('app.tenants','U') IS NOT NULL DROP TABLE app.tenants;
 CREATE TABLE app.tenants (
   tenant_id   UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
@@ -33,7 +50,7 @@ CREATE TABLE app.users (
 );
 GO
 
--- Roles & mapping
+-- Roles & user_roles
 IF OBJECT_ID('app.roles','U') IS NOT NULL DROP TABLE app.roles;
 CREATE TABLE app.roles (
   role_id INT IDENTITY(1,1) PRIMARY KEY,
@@ -56,8 +73,8 @@ GO
 IF OBJECT_ID('app.auth_local','U') IS NOT NULL DROP TABLE app.auth_local;
 CREATE TABLE app.auth_local (
   user_id       UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
-  password_hash VARBINARY(MAX) NOT NULL,     -- store salted hash
-  password_algo NVARCHAR(32) NOT NULL,       -- 'Argon2id'
+  password_hash VARBINARY(MAX) NOT NULL,
+  password_algo NVARCHAR(32) NOT NULL,
   updated_at    DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
   CONSTRAINT FK_authlocal_user FOREIGN KEY (user_id) REFERENCES app.users(user_id)
 );
@@ -81,16 +98,15 @@ IF OBJECT_ID('app.calendars','U') IS NOT NULL DROP TABLE app.calendars;
 CREATE TABLE app.calendars (
   calendar_id   UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   tenant_id     UNIQUEIDENTIFIER NOT NULL,
-  owner_user_id UNIQUEIDENTIFIER NULL,  -- null for shared/team calendar
+  owner_user_id UNIQUEIDENTIFIER NULL,  -- null for shared calendar
   name          NVARCHAR(200) NOT NULL,
   color_hex     CHAR(7) NULL,           -- '#34A853'
   is_primary    BIT NOT NULL DEFAULT 0,
   created_at    DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
   updated_at    DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
   CONSTRAINT FK_cal_tenant FOREIGN KEY (tenant_id) REFERENCES app.tenants(tenant_id),
-  CONSTRAINT FK_cal_owner FOREIGN KEY (owner_user_id) REFERENCES app.users(user_id)
+  CONSTRAINT FK_cal_owner  FOREIGN KEY (owner_user_id) REFERENCES app.users(user_id)
 );
--- Only one primary calendar per owner
 CREATE UNIQUE INDEX UQ_primary_cal ON app.calendars(owner_user_id, is_primary) WHERE is_primary = 1;
 GO
 
@@ -107,26 +123,26 @@ CREATE TABLE app.events (
   all_day         BIT NOT NULL DEFAULT 0,
   status          NVARCHAR(24) NOT NULL DEFAULT 'confirmed',   -- tentative|confirmed|cancelled
   visibility      NVARCHAR(24) NOT NULL DEFAULT 'private',     -- private|public|busy
-  parent_event_id UNIQUEIDENTIFIER NULL, -- for exceptions to a series
+  parent_event_id UNIQUEIDENTIFIER NULL,
   created_by      UNIQUEIDENTIFIER NOT NULL,
   created_at      DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
   updated_at      DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
-  CONSTRAINT FK_event_cal FOREIGN KEY (calendar_id) REFERENCES app.calendars(calendar_id),
-  CONSTRAINT FK_event_creator FOREIGN KEY (created_by) REFERENCES app.users(user_id),
-  CONSTRAINT FK_event_parent FOREIGN KEY (parent_event_id) REFERENCES app.events(event_id),
+  CONSTRAINT FK_event_cal     FOREIGN KEY (calendar_id)     REFERENCES app.calendars(calendar_id),
+  CONSTRAINT FK_event_creator FOREIGN KEY (created_by)      REFERENCES app.users(user_id),
+  CONSTRAINT FK_event_parent  FOREIGN KEY (parent_event_id) REFERENCES app.events(event_id),
   CONSTRAINT CHK_event_time CHECK (end_utc > start_utc)
 );
 CREATE INDEX IX_events_calendar_time ON app.events(calendar_id, start_utc, end_utc);
 GO
 
--- Recurrence (store RRULE; expand in backend)
+-- Recurrence (metadata; expansion done in app)
 IF OBJECT_ID('app.event_recurrences','U') IS NOT NULL DROP TABLE app.event_recurrences;
 CREATE TABLE app.event_recurrences (
   event_id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
-  rrule    NVARCHAR(500) NOT NULL,     -- e.g., FREQ=WEEKLY;BYDAY=MO,WE;UNTIL=...
-  timezone NVARCHAR(64) NOT NULL,      -- source TZ to expand correctly
-  EXDATE   NVARCHAR(MAX) NULL,         -- CSV/JSON of excluded instants
-  RDATE    NVARCHAR(MAX) NULL,         -- CSV/JSON of included instants
+  rrule    NVARCHAR(500) NOT NULL,
+  timezone NVARCHAR(64) NOT NULL,
+  EXDATE   NVARCHAR(MAX) NULL,
+  RDATE    NVARCHAR(MAX) NULL,
   CONSTRAINT FK_recur_event FOREIGN KEY (event_id) REFERENCES app.events(event_id)
 );
 GO
@@ -141,36 +157,36 @@ CREATE TABLE app.event_participants (
   is_optional     BIT NOT NULL DEFAULT 0,
   PRIMARY KEY (event_id, user_id),
   CONSTRAINT FK_part_event FOREIGN KEY (event_id) REFERENCES app.events(event_id),
-  CONSTRAINT FK_part_user FOREIGN KEY (user_id) REFERENCES app.users(user_id)
+  CONSTRAINT FK_part_user  FOREIGN KEY (user_id)  REFERENCES app.users(user_id)
 );
 GO
 
 -- Reminders
 IF OBJECT_ID('app.reminders','U') IS NOT NULL DROP TABLE app.reminders;
 CREATE TABLE app.reminders (
-  reminder_id   BIGINT IDENTITY(1,1) PRIMARY KEY,
-  event_id      UNIQUEIDENTIFIER NOT NULL,
-  minutes_before INT NOT NULL,            -- 0..10080
-  channel       NVARCHAR(24) NOT NULL DEFAULT 'push', -- push|email|sms
-  for_user_id   UNIQUEIDENTIFIER NULL,    -- null = applies to all participants
+  reminder_id    BIGINT IDENTITY(1,1) PRIMARY KEY,
+  event_id       UNIQUEIDENTIFIER NOT NULL,
+  minutes_before INT NOT NULL,           -- 0..10080
+  channel        NVARCHAR(24) NOT NULL DEFAULT 'push', -- push|email|sms
+  for_user_id    UNIQUEIDENTIFIER NULL,  -- null = applies to all participants
   CONSTRAINT FK_rem_event FOREIGN KEY (event_id) REFERENCES app.events(event_id),
   CONSTRAINT CHK_minutes_before CHECK (minutes_before >= 0)
 );
 CREATE INDEX IX_rem_event ON app.reminders(event_id);
 GO
 
--- Availability (weekly templates + exceptions)
+-- Availability
 IF OBJECT_ID('app.availability','U') IS NOT NULL DROP TABLE app.availability;
 CREATE TABLE app.availability (
   availability_id BIGINT IDENTITY(1,1) PRIMARY KEY,
-  user_id   UNIQUEIDENTIFIER NOT NULL,
-  type      NVARCHAR(24) NOT NULL,  -- 'weekly' | 'exception'
-  dow       TINYINT NULL,           -- 1=Mon..7=Sun (for weekly)
-  start_local TIME NULL,
-  end_local   TIME NULL,
-  date_local  DATE NULL,            -- for 'exception'
+  user_id      UNIQUEIDENTIFIER NOT NULL,
+  type         NVARCHAR(24) NOT NULL,  -- 'weekly' | 'exception'
+  dow          TINYINT NULL,           -- 1=Mon..7=Sun (for weekly)
+  start_local  TIME NULL,
+  end_local    TIME NULL,
+  date_local   DATE NULL,              -- for 'exception'
   is_available BIT NOT NULL DEFAULT 1,
-  timezone   NVARCHAR(64) NOT NULL DEFAULT 'Asia/Riyadh',
+  timezone     NVARCHAR(64) NOT NULL DEFAULT 'Asia/Riyadh',
   CONSTRAINT FK_avail_user FOREIGN KEY (user_id) REFERENCES app.users(user_id)
 );
 CREATE INDEX IX_avail_user ON app.availability(user_id);
@@ -179,16 +195,16 @@ GO
 -- Notifications outbox
 IF OBJECT_ID('app.notifications_outbox','U') IS NOT NULL DROP TABLE app.notifications_outbox;
 CREATE TABLE app.notifications_outbox (
-  id            BIGINT IDENTITY(1,1) PRIMARY KEY,
-  tenant_id     UNIQUEIDENTIFIER NOT NULL,
-  channel       NVARCHAR(24) NOT NULL, -- email|push|sms|webhook
-  to_ref        NVARCHAR(400) NOT NULL,
-  subject       NVARCHAR(400) NULL,
-  payload_json  NVARCHAR(MAX) NOT NULL,
-  send_after_utc DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
-  sent_at_utc   DATETIME2(3) NULL,
-  status        NVARCHAR(24) NOT NULL DEFAULT 'queued', -- queued|sent|failed
-  last_error    NVARCHAR(800) NULL
+  id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+  tenant_id       UNIQUEIDENTIFIER NOT NULL,
+  channel         NVARCHAR(24) NOT NULL, -- email|push|sms|webhook
+  to_ref          NVARCHAR(400) NOT NULL,
+  subject         NVARCHAR(400) NULL,
+  payload_json    NVARCHAR(MAX) NOT NULL,
+  send_after_utc  DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+  sent_at_utc     DATETIME2(3) NULL,
+  status          NVARCHAR(24) NOT NULL DEFAULT 'queued', -- queued|sent|failed
+  last_error      NVARCHAR(800) NULL
 );
 CREATE INDEX IX_outbox_ready ON app.notifications_outbox(status, send_after_utc);
 GO
@@ -233,38 +249,9 @@ CREATE TABLE app.chat_messages (
 GO
 
 /* ================================
-   2) SEED (minimal)
-   ================================ */
-INSERT INTO app.roles(code,label) VALUES ('admin','Administrator'),('manager','Manager'),('user','User');
-
-DECLARE @tenant UNIQUEIDENTIFIER = NEWID();
-INSERT INTO app.tenants(tenant_id, name) VALUES (@tenant, N'Demo Tenant');
-
-DECLARE @u1 UNIQUEIDENTIFIER = NEWID();
-DECLARE @u2 UNIQUEIDENTIFIER = NEWID();
-
-INSERT INTO app.users(user_id, tenant_id, email, display_name)
-VALUES
-(@u1, @tenant, N'alice@example.com', N'Alice'),
-(@u2, @tenant, N'bob@example.com',   N'Bob');
-
-INSERT INTO app.user_roles(user_id, role_id)
-SELECT @u1, role_id FROM app.roles WHERE code = 'admin';
-
-DECLARE @cal1 UNIQUEIDENTIFIER = NEWID();
-DECLARE @cal2 UNIQUEIDENTIFIER = NEWID();
-
-INSERT INTO app.calendars(calendar_id, tenant_id, owner_user_id, name, is_primary)
-VALUES
-(@cal1, @tenant, @u1, N'Alice Calendar', 1),
-(@cal2, @tenant, @u2, N'Bob Calendar',   1);
-GO
-
-/* ================================
-   3) VIEWS (for common reads)
+   2) VIEWS
    ================================ */
 
--- Events with calendar & owner (handy for API listing)
 IF OBJECT_ID('app.v_event_full','V') IS NOT NULL DROP VIEW app.v_event_full;
 GO
 CREATE VIEW app.v_event_full AS
@@ -280,7 +267,6 @@ JOIN app.calendars c ON c.calendar_id = e.calendar_id
 LEFT JOIN app.users u ON u.user_id = c.owner_user_id;
 GO
 
--- Participant counts per event
 IF OBJECT_ID('app.v_event_participant_counts','V') IS NOT NULL DROP VIEW app.v_event_participant_counts;
 GO
 CREATE VIEW app.v_event_participant_counts AS
@@ -295,7 +281,6 @@ LEFT JOIN app.event_participants p ON p.event_id = e.event_id
 GROUP BY e.event_id;
 GO
 
--- Simple agenda for a user (UTC; supply time zone in app layer)
 IF OBJECT_ID('app.v_user_agenda','V') IS NOT NULL DROP VIEW app.v_user_agenda;
 GO
 CREATE VIEW app.v_user_agenda AS
@@ -304,22 +289,18 @@ SELECT
   e.event_id, e.title, e.start_utc, e.end_utc, e.status, e.all_day,
   c.name AS calendar_name, c.color_hex, c.owner_user_id
 FROM app.event_participants p
-JOIN app.events e ON e.event_id = p.event_id
+JOIN app.events e    ON e.event_id = p.event_id
 JOIN app.calendars c ON c.calendar_id = e.calendar_id
 WHERE e.status <> 'cancelled';
 GO
 
 /* ================================
-   4) FUNCTIONS (scalar/table)
+   3) FUNCTIONS
    ================================ */
 
--- UTC -> Local time conversion using a named Windows TZ
 IF OBJECT_ID('app.fn_utc_to_local','FN') IS NOT NULL DROP FUNCTION app.fn_utc_to_local;
 GO
-CREATE FUNCTION app.fn_utc_to_local (
-  @utc DATETIME2(3),
-  @tz  NVARCHAR(64)
-)
+CREATE FUNCTION app.fn_utc_to_local (@utc DATETIME2(3), @tz NVARCHAR(64))
 RETURNS DATETIME2(3)
 AS
 BEGIN
@@ -327,14 +308,9 @@ BEGIN
 END;
 GO
 
--- Is user free in [start,end)?
 IF OBJECT_ID('app.fn_is_user_free','FN') IS NOT NULL DROP FUNCTION app.fn_is_user_free;
 GO
-CREATE FUNCTION app.fn_is_user_free (
-  @userId UNIQUEIDENTIFIER,
-  @start  DATETIME2(3),
-  @end    DATETIME2(3)
-)
+CREATE FUNCTION app.fn_is_user_free (@userId UNIQUEIDENTIFIER, @start DATETIME2(3), @end DATETIME2(3))
 RETURNS BIT
 AS
 BEGIN
@@ -348,16 +324,13 @@ BEGIN
       AND e.end_utc > @start AND e.start_utc < @end
   )
     SET @busy = 1;
-  RETURN IIF(@busy=1,0,1); -- 1=free, 0=busy
+  RETURN IIF(@busy=1,0,1);
 END;
 GO
 
--- Next upcoming event for a user (UTC)
 IF OBJECT_ID('app.fn_next_event','IF') IS NOT NULL DROP FUNCTION app.fn_next_event;
 GO
-CREATE FUNCTION app.fn_next_event (
-  @userId UNIQUEIDENTIFIER
-)
+CREATE FUNCTION app.fn_next_event (@userId UNIQUEIDENTIFIER)
 RETURNS TABLE
 AS
 RETURN
@@ -370,7 +343,6 @@ RETURN
   ORDER BY e.start_utc ASC;
 GO
 
--- Return base times for a single event (backend handles RRULE expansion)
 IF OBJECT_ID('app.fn_event_occurrences','IF') IS NOT NULL DROP FUNCTION app.fn_event_occurrences;
 GO
 CREATE FUNCTION app.fn_event_occurrences (@eventId UNIQUEIDENTIFIER)
@@ -383,25 +355,24 @@ RETURN
 GO
 
 /* ================================
-   5) PROCEDURES
+   4) PROCEDURES
    ================================ */
 
--- Create event atomically + participants + reminders
 IF OBJECT_ID('app.sp_create_event','P') IS NOT NULL DROP PROCEDURE app.sp_create_event;
 GO
 CREATE PROCEDURE app.sp_create_event
-  @calendar_id     UNIQUEIDENTIFIER,
-  @title           NVARCHAR(300),
-  @description     NVARCHAR(MAX) = NULL,
-  @location        NVARCHAR(400) = NULL,
-  @start_utc       DATETIME2(3),
-  @end_utc         DATETIME2(3),
-  @all_day         BIT = 0,
-  @status          NVARCHAR(24) = 'confirmed',
-  @visibility      NVARCHAR(24) = 'private',
-  @created_by      UNIQUEIDENTIFIER,
-  @participants_json NVARCHAR(MAX) = NULL,  -- JSON array of user_id
-  @reminders_json    NVARCHAR(MAX) = NULL   -- JSON array [{minutes_before:int,channel:string,for_user_id?:guid}]
+  @calendar_id       UNIQUEIDENTIFIER,
+  @title             NVARCHAR(300),
+  @description       NVARCHAR(MAX) = NULL,
+  @location          NVARCHAR(400) = NULL,
+  @start_utc         DATETIME2(3),
+  @end_utc           DATETIME2(3),
+  @all_day           BIT = 0,
+  @status            NVARCHAR(24) = 'confirmed',
+  @visibility        NVARCHAR(24) = 'private',
+  @created_by        UNIQUEIDENTIFIER,
+  @participants_json NVARCHAR(MAX) = NULL,  -- JSON array of user_ids
+  @reminders_json    NVARCHAR(MAX) = NULL   -- JSON array of objects
 AS
 BEGIN
   SET NOCOUNT ON;
@@ -410,8 +381,10 @@ BEGIN
 
     DECLARE @event_id UNIQUEIDENTIFIER = NEWID();
 
-    INSERT INTO app.events(event_id, calendar_id, title, description, location, start_utc, end_utc, all_day, status, visibility, created_by)
-    VALUES (@event_id, @calendar_id, @title, @description, @location, @start_utc, @end_utc, @all_day, @status, @visibility, @created_by);
+    INSERT INTO app.events(event_id, calendar_id, title, description, location,
+                           start_utc, end_utc, all_day, status, visibility, created_by)
+    VALUES (@event_id, @calendar_id, @title, @description, @location,
+            @start_utc, @end_utc, @all_day, @status, @visibility, @created_by);
 
     -- participants
     IF @participants_json IS NOT NULL
@@ -421,7 +394,7 @@ BEGIN
       FROM OPENJSON(@participants_json);
     END
 
-    -- ensure creator is organizer participant
+    -- ensure creator is organizer
     IF NOT EXISTS (SELECT 1 FROM app.event_participants WHERE event_id=@event_id AND user_id=@created_by)
     BEGIN
       INSERT INTO app.event_participants(event_id, user_id, role, response_status)
@@ -434,8 +407,8 @@ BEGIN
       INSERT INTO app.reminders(event_id, minutes_before, channel, for_user_id)
       SELECT
         @event_id,
-        JSON_VALUE(value,'$.minutes_before'),
-        ISNULL(JSON_VALUE(value,'$.channel'), 'push'),
+        TRY_CONVERT(INT, JSON_VALUE(value,'$.minutes_before')),
+        ISNULL(JSON_VALUE(value,'$.channel'),'push'),
         TRY_CONVERT(UNIQUEIDENTIFIER, JSON_VALUE(value,'$.for_user_id'))
       FROM OPENJSON(@reminders_json);
     END
@@ -450,7 +423,6 @@ BEGIN
 END;
 GO
 
--- Add participant
 IF OBJECT_ID('app.sp_add_participant','P') IS NOT NULL DROP PROCEDURE app.sp_add_participant;
 GO
 CREATE PROCEDURE app.sp_add_participant
@@ -468,7 +440,6 @@ BEGIN
 END;
 GO
 
--- Common free slots (simple busy check; refine in app)
 IF OBJECT_ID('app.sp_common_free_slots','P') IS NOT NULL DROP PROCEDURE app.sp_common_free_slots;
 GO
 CREATE PROCEDURE app.sp_common_free_slots
@@ -491,45 +462,42 @@ BEGIN
   SELECT
     @from AS range_start,
     @to   AS range_end,
-    -- Return a boolean flag: 1 if both free for the entire range (coarse check)
     CASE WHEN EXISTS (SELECT 1 FROM Busy WHERE user_id=@userA)
            OR EXISTS (SELECT 1 FROM Busy WHERE user_id=@userB)
          THEN CAST(0 AS BIT) ELSE CAST(1 AS BIT) END AS both_free;
 END;
 GO
 
--- Enqueue due reminders (run per minute by an external scheduler/agent)
 IF OBJECT_ID('app.sp_enqueue_due_reminders','P') IS NOT NULL DROP PROCEDURE app.sp_enqueue_due_reminders;
 GO
 CREATE PROCEDURE app.sp_enqueue_due_reminders
 AS
 BEGIN
   SET NOCOUNT ON;
+
   INSERT INTO app.notifications_outbox (tenant_id, channel, to_ref, subject, payload_json, send_after_utc)
   SELECT DISTINCT
     u.tenant_id,
     r.channel,
     COALESCE(u.email, u.phone, N'') AS to_ref,
     CONCAT(N'Reminder: ', e.title),
-    CONCAT(N'{"event_id":"', CONVERT(NVARCHAR(36), e.event_id),
-           N'","title":"', REPLACE(e.title,'"','""'),
-           N'","start_utc":"', CONVERT(NVARCHAR(33), e.start_utc, 127),
-           N'"}'),
+    CONCAT(
+      N'{"event_id":"', CONVERT(NVARCHAR(36), e.event_id),
+      N'","title":"', REPLACE(e.title,'"','""'),
+      N'","start_utc":"', CONVERT(NVARCHAR(33), e.start_utc, 127), N'"}'
+    ),
     SYSUTCDATETIME()
   FROM app.reminders r
   JOIN app.events e ON e.event_id = r.event_id
-  -- target: for_user_id else event creator else each participant
   JOIN (
-      SELECT DISTINCT
-        COALESCE(r.for_user_id, e.created_by, p.user_id) AS target_user_id,
-        e.event_id
+      SELECT DISTINCT COALESCE(r.for_user_id, e.created_by, p.user_id) AS target_user_id, e.event_id
       FROM app.reminders r
       JOIN app.events e ON e.event_id = r.event_id
       LEFT JOIN app.event_participants p ON p.event_id = e.event_id
   ) t ON t.event_id = e.event_id
   JOIN app.users u ON u.user_id = t.target_user_id
   WHERE e.start_utc > SYSUTCDATETIME()
-    AND e.start_utc <= DATEADD(minute, r.minutes_before, SYSUTCDATETIME())
+    AND e.start_utc <= DATEADD(MINUTE, r.minutes_before, SYSUTCDATETIME())
     AND NOT EXISTS (
       SELECT 1 FROM app.notifications_outbox o
       WHERE o.status = 'queued'
@@ -539,7 +507,6 @@ BEGIN
 END;
 GO
 
--- Write audit row
 IF OBJECT_ID('app.sp_write_audit','P') IS NOT NULL DROP PROCEDURE app.sp_write_audit;
 GO
 CREATE PROCEDURE app.sp_write_audit
@@ -557,8 +524,10 @@ BEGIN
 END;
 GO
 
+/* ================================
+   5) TRIGGERS
+   ================================ */
 
--- calendars.updated_at
 IF OBJECT_ID('app.tr_calendars_touch','TR') IS NOT NULL DROP TRIGGER app.tr_calendars_touch;
 GO
 CREATE TRIGGER app.tr_calendars_touch ON app.calendars
@@ -572,7 +541,6 @@ BEGIN
 END;
 GO
 
--- events.updated_at
 IF OBJECT_ID('app.tr_events_touch','TR') IS NOT NULL DROP TRIGGER app.tr_events_touch;
 GO
 CREATE TRIGGER app.tr_events_touch ON app.events
@@ -587,31 +555,77 @@ END;
 GO
 
 /* ================================
-   7) QUICK DEMO DATA (optional)
+   6) SEED (minimal, safe)
    ================================ */
-DECLARE @alice UNIQUEIDENTIFIER = (SELECT user_id FROM app.users WHERE email='alice@example.com');
-DECLARE @bob   UNIQUEIDENTIFIER = (SELECT user_id FROM app.users WHERE email='bob@example.com');
-DECLARE @calAlice UNIQUEIDENTIFIER = (SELECT calendar_id FROM app.calendars WHERE owner_user_id=@alice AND is_primary=1);
 
-IF @alice IS NOT NULL AND @bob IS NOT NULL
-BEGIN
-  DECLARE @now DATETIME2(3) = SYSUTCDATETIME();
-  DECLARE @e1 UNIQUEIDENTIFIER;
-
-  EXEC app.sp_create_event
-    @calendar_id=@calAlice,
-    @title=N'Kickoff',
-    @description=N'Project kickoff',
-    @location=N'Meeting Room A',
-    @start_utc=DATEADD(hour,1,@now),
-    @end_utc=DATEADD(hour,2,@now),
-    @all_day=0,
-    @status='confirmed',
-    @visibility='private',
-    @created_by=@alice,
-    @participants_json=CONCAT('["', CONVERT(NVARCHAR(36), @bob), '"]'),
-    @reminders_json=N'[{"minutes_before":30,"channel":"email"}]';
-END
+-- Roles
+IF NOT EXISTS (SELECT 1 FROM app.roles)
+  INSERT INTO app.roles(code,label)
+  VALUES (N'admin',N'Administrator'),(N'manager',N'Manager'),(N'user',N'User');
 GO
 
--- End of schedule.sql
+-- Tenant + two users + calendars
+DECLARE @tenant UNIQUEIDENTIFIER = (SELECT TOP 1 tenant_id FROM app.tenants ORDER BY created_at);
+IF @tenant IS NULL
+BEGIN
+  SET @tenant = NEWID();
+  INSERT INTO app.tenants(tenant_id, name) VALUES (@tenant, N'Demo Tenant');
+END
+
+DECLARE @alice UNIQUEIDENTIFIER = (SELECT user_id FROM app.users WHERE email = N'alice@example.com');
+IF @alice IS NULL
+BEGIN
+  SET @alice = NEWID();
+  INSERT INTO app.users(user_id, tenant_id, email, display_name)
+  VALUES (@alice, @tenant, N'alice@example.com', N'Alice');
+END
+
+DECLARE @bob UNIQUEIDENTIFIER = (SELECT user_id FROM app.users WHERE email = N'bob@example.com');
+IF @bob IS NULL
+BEGIN
+  SET @bob = NEWID();
+  INSERT INTO app.users(user_id, tenant_id, email, display_name)
+  VALUES (@bob, @tenant, N'bob@example.com', N'Bob');
+END
+
+IF NOT EXISTS (SELECT 1 FROM app.user_roles WHERE user_id=@alice)
+  INSERT INTO app.user_roles(user_id, role_id)
+  SELECT @alice, role_id FROM app.roles WHERE code='admin';
+
+DECLARE @calAlice UNIQUEIDENTIFIER = (SELECT TOP 1 calendar_id FROM app.calendars WHERE owner_user_id=@alice ORDER BY is_primary DESC, created_at);
+IF @calAlice IS NULL
+BEGIN
+  SET @calAlice = NEWID();
+  INSERT INTO app.calendars(calendar_id, tenant_id, owner_user_id, name, is_primary)
+  VALUES (@calAlice, @tenant, @alice, N'Alice Calendar', 1);
+END
+
+DECLARE @calBob UNIQUEIDENTIFIER = (SELECT TOP 1 calendar_id FROM app.calendars WHERE owner_user_id=@bob ORDER BY is_primary DESC, created_at);
+IF @calBob IS NULL
+BEGIN
+  SET @calBob = NEWID();
+  INSERT INTO app.calendars(calendar_id, tenant_id, owner_user_id, name, is_primary)
+  VALUES (@calBob, @tenant, @bob, N'Bob Calendar', 1);
+END
+
+-- One sample event on Alice's calendar
+DECLARE @now      DATETIME2(3) = SYSUTCDATETIME();
+DECLARE @startUtc DATETIME2(3) = DATEADD(MINUTE, 60,  @now);  -- +1h
+DECLARE @endUtc   DATETIME2(3) = DATEADD(MINUTE, 120, @now);  -- +2h
+DECLARE @participants NVARCHAR(MAX) = N'["' + CONVERT(NVARCHAR(36), @bob) + N'"]';
+DECLARE @reminders    NVARCHAR(MAX) = N'[{"minutes_before":30,"channel":"email"}]';
+
+EXEC app.sp_create_event
+  @calendar_id       = @calAlice,
+  @title             = N'Project Kickoff',
+  @description       = N'Initial meeting',
+  @location          = N'Meeting Room A',
+  @start_utc         = @startUtc,
+  @end_utc           = @endUtc,
+  @all_day           = 0,
+  @status            = 'confirmed',
+  @visibility        = 'private',
+  @created_by        = @alice,
+  @participants_json = @participants,
+  @reminders_json    = @reminders;
+GO
