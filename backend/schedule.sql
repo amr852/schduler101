@@ -1,30 +1,119 @@
-/* ================================
-   Scheduler DB – FULL SETUP
-   ================================ */
-USE scheduler_db;
+/* ======================================================================
+   SCHEDULER DB – FULL RE-RUNNABLE SETUP
+   ====================================================================== */
+
+---------------------------
+-- 0) Database & Security
+---------------------------
+IF DB_ID(N'scheduler_db') IS NULL
+BEGIN
+    PRINT 'Creating database [scheduler_db]...';
+    CREATE DATABASE [scheduler_db];
+END
 GO
 
+-- Compatibility (AT TIME ZONE, OPENJSON need >= 130; we set to 150)
+ALTER DATABASE [scheduler_db] SET COMPATIBILITY_LEVEL = 150;
+GO
+
+-- Create/repair SQL login at server-level (run as sysadmin)
+USE [master];
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.sql_logins WHERE name = N'app_user')
+BEGIN
+    PRINT 'Creating login [app_user]...';
+    CREATE LOGIN [app_user]
+        WITH PASSWORD = 'YourStrong!Passw0rd',
+             CHECK_POLICY = OFF,
+             CHECK_EXPIRATION = OFF;
+END
+ELSE
+BEGIN
+    PRINT 'Resetting password and unlocking login [app_user]...';
+    ALTER LOGIN [app_user] WITH PASSWORD = 'YourStrong!Passw0rd';
+    ALTER LOGIN [app_user] WITH PASSWORD = 'YourStrong!Passw0rd' UNLOCK;
+END
+ALTER LOGIN [app_user] ENABLE;
+ALTER LOGIN [app_user] WITH DEFAULT_DATABASE = [scheduler_db];
+GO
+
+-- Map login to DB user and grant role (dev convenience)
+USE [scheduler_db];
+GO
 IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'app_user')
     CREATE USER [app_user] FOR LOGIN [app_user];
 
-ALTER ROLE db_owner ADD MEMBER [app_user];  -- for dev/testing
-
-
--- Use DB
-USE scheduler_db;
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.database_role_members drm
+    JOIN sys.database_principals r ON r.principal_id = drm.role_principal_id AND r.name = N'db_owner'
+    JOIN sys.database_principals m ON m.principal_id = drm.member_principal_id AND m.name = N'app_user'
+)
+    ALTER ROLE [db_owner] ADD MEMBER [app_user];
 GO
 
--- 0.1) Ensure schema "app" exists
+
+-----------------------------------------
+-- 1) Create schema (if not exists)
+-----------------------------------------
 IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = N'app')
-  EXEC ('CREATE SCHEMA app AUTHORIZATION dbo;');
+    EXEC ('CREATE SCHEMA app AUTHORIZATION dbo;');
 GO
 
-/* ================================
-   1) TABLES
-   ================================ */
 
+------------------------------------------------------------
+-- 2) Safe DROP of programmable objects & tables (in order)
+------------------------------------------------------------
+-- Views
+DROP VIEW IF EXISTS app.v_event_full;
+DROP VIEW IF EXISTS app.v_event_participant_counts;
+DROP VIEW IF EXISTS app.v_user_agenda;
+GO
+
+-- Functions
+DROP FUNCTION IF EXISTS app.fn_utc_to_local;
+DROP FUNCTION IF EXISTS app.fn_is_user_free;
+DROP FUNCTION IF EXISTS app.fn_next_event;
+DROP FUNCTION IF EXISTS app.fn_event_occurrences;
+GO
+
+-- Procedures
+DROP PROCEDURE IF EXISTS app.sp_create_event;
+DROP PROCEDURE IF EXISTS app.sp_add_participant;
+DROP PROCEDURE IF EXISTS app.sp_common_free_slots;
+DROP PROCEDURE IF EXISTS app.sp_enqueue_due_reminders;
+DROP PROCEDURE IF EXISTS app.sp_write_audit;
+GO
+
+-- Triggers
+DROP TRIGGER IF EXISTS app.tr_calendars_touch;
+DROP TRIGGER IF EXISTS app.tr_events_touch;
+GO
+
+-- Tables (children → parents)
+DROP TABLE IF EXISTS app.chat_messages;
+DROP TABLE IF EXISTS app.chat_conversations;
+DROP TABLE IF EXISTS app.audit_log;
+DROP TABLE IF EXISTS app.notifications_outbox;
+DROP TABLE IF EXISTS app.availability;
+DROP TABLE IF EXISTS app.reminders;
+DROP TABLE IF EXISTS app.event_participants;
+DROP TABLE IF EXISTS app.event_recurrences;
+DROP TABLE IF EXISTS app.events;
+DROP TABLE IF EXISTS app.calendars;
+DROP TABLE IF EXISTS app.sessions;
+DROP TABLE IF EXISTS app.auth_local;
+DROP TABLE IF EXISTS app.user_roles;
+DROP TABLE IF EXISTS app.roles;
+DROP TABLE IF EXISTS app.users;
+DROP TABLE IF EXISTS app.tenants;
+GO
+
+
+---------------------------
+-- 3) TABLES
+---------------------------
 -- Tenants
-IF OBJECT_ID('app.tenants','U') IS NOT NULL DROP TABLE app.tenants;
 CREATE TABLE app.tenants (
   tenant_id   UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   name        NVARCHAR(200) NOT NULL,
@@ -34,7 +123,6 @@ CREATE TABLE app.tenants (
 GO
 
 -- Users
-IF OBJECT_ID('app.users','U') IS NOT NULL DROP TABLE app.users;
 CREATE TABLE app.users (
   user_id      UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   tenant_id    UNIQUEIDENTIFIER NOT NULL,
@@ -50,8 +138,7 @@ CREATE TABLE app.users (
 );
 GO
 
--- Roles & user_roles
-IF OBJECT_ID('app.roles','U') IS NOT NULL DROP TABLE app.roles;
+-- Roles
 CREATE TABLE app.roles (
   role_id INT IDENTITY(1,1) PRIMARY KEY,
   code    NVARCHAR(64) NOT NULL UNIQUE,      -- 'admin','manager','user'
@@ -59,7 +146,7 @@ CREATE TABLE app.roles (
 );
 GO
 
-IF OBJECT_ID('app.user_roles','U') IS NOT NULL DROP TABLE app.user_roles;
+-- user_roles
 CREATE TABLE app.user_roles (
   user_id UNIQUEIDENTIFIER NOT NULL,
   role_id INT NOT NULL,
@@ -69,8 +156,7 @@ CREATE TABLE app.user_roles (
 );
 GO
 
--- Local auth & sessions
-IF OBJECT_ID('app.auth_local','U') IS NOT NULL DROP TABLE app.auth_local;
+-- Local auth
 CREATE TABLE app.auth_local (
   user_id       UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
   password_hash VARBINARY(MAX) NOT NULL,
@@ -80,7 +166,7 @@ CREATE TABLE app.auth_local (
 );
 GO
 
-IF OBJECT_ID('app.sessions','U') IS NOT NULL DROP TABLE app.sessions;
+-- Sessions
 CREATE TABLE app.sessions (
   session_id UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   user_id    UNIQUEIDENTIFIER NOT NULL,
@@ -94,7 +180,6 @@ CREATE INDEX IX_sessions_user_expires ON app.sessions(user_id, expires_at);
 GO
 
 -- Calendars
-IF OBJECT_ID('app.calendars','U') IS NOT NULL DROP TABLE app.calendars;
 CREATE TABLE app.calendars (
   calendar_id   UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   tenant_id     UNIQUEIDENTIFIER NOT NULL,
@@ -111,7 +196,6 @@ CREATE UNIQUE INDEX UQ_primary_cal ON app.calendars(owner_user_id, is_primary) W
 GO
 
 -- Events
-IF OBJECT_ID('app.events','U') IS NOT NULL DROP TABLE app.events;
 CREATE TABLE app.events (
   event_id        UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   calendar_id     UNIQUEIDENTIFIER NOT NULL,
@@ -135,8 +219,7 @@ CREATE TABLE app.events (
 CREATE INDEX IX_events_calendar_time ON app.events(calendar_id, start_utc, end_utc);
 GO
 
--- Recurrence (metadata; expansion done in app)
-IF OBJECT_ID('app.event_recurrences','U') IS NOT NULL DROP TABLE app.event_recurrences;
+-- Recurrence metadata
 CREATE TABLE app.event_recurrences (
   event_id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
   rrule    NVARCHAR(500) NOT NULL,
@@ -148,7 +231,6 @@ CREATE TABLE app.event_recurrences (
 GO
 
 -- Participants
-IF OBJECT_ID('app.event_participants','U') IS NOT NULL DROP TABLE app.event_participants;
 CREATE TABLE app.event_participants (
   event_id        UNIQUEIDENTIFIER NOT NULL,
   user_id         UNIQUEIDENTIFIER NOT NULL,
@@ -159,10 +241,10 @@ CREATE TABLE app.event_participants (
   CONSTRAINT FK_part_event FOREIGN KEY (event_id) REFERENCES app.events(event_id),
   CONSTRAINT FK_part_user  FOREIGN KEY (user_id)  REFERENCES app.users(user_id)
 );
+CREATE INDEX IX_part_user ON app.event_participants(user_id);
 GO
 
 -- Reminders
-IF OBJECT_ID('app.reminders','U') IS NOT NULL DROP TABLE app.reminders;
 CREATE TABLE app.reminders (
   reminder_id    BIGINT IDENTITY(1,1) PRIMARY KEY,
   event_id       UNIQUEIDENTIFIER NOT NULL,
@@ -176,7 +258,6 @@ CREATE INDEX IX_rem_event ON app.reminders(event_id);
 GO
 
 -- Availability
-IF OBJECT_ID('app.availability','U') IS NOT NULL DROP TABLE app.availability;
 CREATE TABLE app.availability (
   availability_id BIGINT IDENTITY(1,1) PRIMARY KEY,
   user_id      UNIQUEIDENTIFIER NOT NULL,
@@ -192,8 +273,7 @@ CREATE TABLE app.availability (
 CREATE INDEX IX_avail_user ON app.availability(user_id);
 GO
 
--- Notifications outbox
-IF OBJECT_ID('app.notifications_outbox','U') IS NOT NULL DROP TABLE app.notifications_outbox;
+-- Outbox (no FK to keep loose coupling)
 CREATE TABLE app.notifications_outbox (
   id              BIGINT IDENTITY(1,1) PRIMARY KEY,
   tenant_id       UNIQUEIDENTIFIER NOT NULL,
@@ -210,7 +290,6 @@ CREATE INDEX IX_outbox_ready ON app.notifications_outbox(status, send_after_utc)
 GO
 
 -- Audit log
-IF OBJECT_ID('app.audit_log','U') IS NOT NULL DROP TABLE app.audit_log;
 CREATE TABLE app.audit_log (
   audit_id      BIGINT IDENTITY(1,1) PRIMARY KEY,
   tenant_id     UNIQUEIDENTIFIER NOT NULL,
@@ -224,8 +303,7 @@ CREATE TABLE app.audit_log (
 );
 GO
 
--- Chat (assistant threads)
-IF OBJECT_ID('app.chat_conversations','U') IS NOT NULL DROP TABLE app.chat_conversations;
+-- Chat
 CREATE TABLE app.chat_conversations (
   conversation_id UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   tenant_id       UNIQUEIDENTIFIER NOT NULL,
@@ -235,7 +313,6 @@ CREATE TABLE app.chat_conversations (
 );
 GO
 
-IF OBJECT_ID('app.chat_messages','U') IS NOT NULL DROP TABLE app.chat_messages;
 CREATE TABLE app.chat_messages (
   message_id      UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID() PRIMARY KEY,
   conversation_id UNIQUEIDENTIFIER NOT NULL,
@@ -248,12 +325,14 @@ CREATE TABLE app.chat_messages (
 );
 GO
 
-/* ================================
-   2) VIEWS
-   ================================ */
 
-IF OBJECT_ID('app.v_event_full','V') IS NOT NULL DROP VIEW app.v_event_full;
+---------------------------
+-- 4) VIEWS
+---------------------------
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
 GO
+
 CREATE VIEW app.v_event_full AS
 SELECT
   e.event_id, e.title, e.description, e.location,
@@ -267,22 +346,18 @@ JOIN app.calendars c ON c.calendar_id = e.calendar_id
 LEFT JOIN app.users u ON u.user_id = c.owner_user_id;
 GO
 
-IF OBJECT_ID('app.v_event_participant_counts','V') IS NOT NULL DROP VIEW app.v_event_participant_counts;
-GO
 CREATE VIEW app.v_event_participant_counts AS
 SELECT
   e.event_id,
   COUNT(*) AS participant_count,
-  SUM(CASE WHEN p.response_status = 'accepted' THEN 1 ELSE 0 END) AS accepted_count,
+  SUM(CASE WHEN p.response_status = 'accepted'  THEN 1 ELSE 0 END) AS accepted_count,
   SUM(CASE WHEN p.response_status = 'tentative' THEN 1 ELSE 0 END) AS tentative_count,
-  SUM(CASE WHEN p.response_status = 'declined' THEN 1 ELSE 0 END) AS declined_count
+  SUM(CASE WHEN p.response_status = 'declined'  THEN 1 ELSE 0 END) AS declined_count
 FROM app.events e
 LEFT JOIN app.event_participants p ON p.event_id = e.event_id
 GROUP BY e.event_id;
 GO
 
-IF OBJECT_ID('app.v_user_agenda','V') IS NOT NULL DROP VIEW app.v_user_agenda;
-GO
 CREATE VIEW app.v_user_agenda AS
 SELECT
   p.user_id,
@@ -294,12 +369,10 @@ JOIN app.calendars c ON c.calendar_id = e.calendar_id
 WHERE e.status <> 'cancelled';
 GO
 
-/* ================================
-   3) FUNCTIONS
-   ================================ */
 
-IF OBJECT_ID('app.fn_utc_to_local','FN') IS NOT NULL DROP FUNCTION app.fn_utc_to_local;
-GO
+---------------------------
+-- 5) FUNCTIONS
+---------------------------
 CREATE FUNCTION app.fn_utc_to_local (@utc DATETIME2(3), @tz NVARCHAR(64))
 RETURNS DATETIME2(3)
 AS
@@ -308,8 +381,6 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('app.fn_is_user_free','FN') IS NOT NULL DROP FUNCTION app.fn_is_user_free;
-GO
 CREATE FUNCTION app.fn_is_user_free (@userId UNIQUEIDENTIFIER, @start DATETIME2(3), @end DATETIME2(3))
 RETURNS BIT
 AS
@@ -328,8 +399,6 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('app.fn_next_event','IF') IS NOT NULL DROP FUNCTION app.fn_next_event;
-GO
 CREATE FUNCTION app.fn_next_event (@userId UNIQUEIDENTIFIER)
 RETURNS TABLE
 AS
@@ -343,8 +412,6 @@ RETURN
   ORDER BY e.start_utc ASC;
 GO
 
-IF OBJECT_ID('app.fn_event_occurrences','IF') IS NOT NULL DROP FUNCTION app.fn_event_occurrences;
-GO
 CREATE FUNCTION app.fn_event_occurrences (@eventId UNIQUEIDENTIFIER)
 RETURNS TABLE
 AS
@@ -354,12 +421,10 @@ RETURN
   WHERE event_id = @eventId;
 GO
 
-/* ================================
-   4) PROCEDURES
-   ================================ */
 
-IF OBJECT_ID('app.sp_create_event','P') IS NOT NULL DROP PROCEDURE app.sp_create_event;
-GO
+---------------------------
+-- 6) PROCEDURES
+---------------------------
 CREATE PROCEDURE app.sp_create_event
   @calendar_id       UNIQUEIDENTIFIER,
   @title             NVARCHAR(300),
@@ -423,8 +488,6 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('app.sp_add_participant','P') IS NOT NULL DROP PROCEDURE app.sp_add_participant;
-GO
 CREATE PROCEDURE app.sp_add_participant
   @event_id UNIQUEIDENTIFIER,
   @user_id  UNIQUEIDENTIFIER,
@@ -440,8 +503,6 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('app.sp_common_free_slots','P') IS NOT NULL DROP PROCEDURE app.sp_common_free_slots;
-GO
 CREATE PROCEDURE app.sp_common_free_slots
   @userA UNIQUEIDENTIFIER,
   @userB UNIQUEIDENTIFIER,
@@ -468,8 +529,6 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('app.sp_enqueue_due_reminders','P') IS NOT NULL DROP PROCEDURE app.sp_enqueue_due_reminders;
-GO
 CREATE PROCEDURE app.sp_enqueue_due_reminders
 AS
 BEGIN
@@ -507,8 +566,6 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('app.sp_write_audit','P') IS NOT NULL DROP PROCEDURE app.sp_write_audit;
-GO
 CREATE PROCEDURE app.sp_write_audit
   @tenantId   UNIQUEIDENTIFIER,
   @actorUser  UNIQUEIDENTIFIER = NULL,
@@ -524,12 +581,10 @@ BEGIN
 END;
 GO
 
-/* ================================
-   5) TRIGGERS
-   ================================ */
 
-IF OBJECT_ID('app.tr_calendars_touch','TR') IS NOT NULL DROP TRIGGER app.tr_calendars_touch;
-GO
+---------------------------
+-- 7) TRIGGERS
+---------------------------
 CREATE TRIGGER app.tr_calendars_touch ON app.calendars
 AFTER UPDATE
 AS
@@ -541,8 +596,6 @@ BEGIN
 END;
 GO
 
-IF OBJECT_ID('app.tr_events_touch','TR') IS NOT NULL DROP TRIGGER app.tr_events_touch;
-GO
 CREATE TRIGGER app.tr_events_touch ON app.events
 AFTER UPDATE
 AS
@@ -554,17 +607,17 @@ BEGIN
 END;
 GO
 
-/* ================================
-   6) SEED (minimal, safe)
-   ================================ */
 
+---------------------------
+-- 8) SEED DATA (idempotent)
+---------------------------
 -- Roles
 IF NOT EXISTS (SELECT 1 FROM app.roles)
   INSERT INTO app.roles(code,label)
   VALUES (N'admin',N'Administrator'),(N'manager',N'Manager'),(N'user',N'User');
 GO
 
--- Tenant + two users + calendars
+-- Tenant + users + primary calendars + sample event
 DECLARE @tenant UNIQUEIDENTIFIER = (SELECT TOP 1 tenant_id FROM app.tenants ORDER BY created_at);
 IF @tenant IS NULL
 BEGIN
@@ -608,24 +661,28 @@ BEGIN
   VALUES (@calBob, @tenant, @bob, N'Bob Calendar', 1);
 END
 
--- One sample event on Alice's calendar
 DECLARE @now      DATETIME2(3) = SYSUTCDATETIME();
 DECLARE @startUtc DATETIME2(3) = DATEADD(MINUTE, 60,  @now);  -- +1h
 DECLARE @endUtc   DATETIME2(3) = DATEADD(MINUTE, 120, @now);  -- +2h
 DECLARE @participants NVARCHAR(MAX) = N'["' + CONVERT(NVARCHAR(36), @bob) + N'"]';
 DECLARE @reminders    NVARCHAR(MAX) = N'[{"minutes_before":30,"channel":"email"}]';
 
-EXEC app.sp_create_event
-  @calendar_id       = @calAlice,
-  @title             = N'Project Kickoff',
-  @description       = N'Initial meeting',
-  @location          = N'Meeting Room A',
-  @start_utc         = @startUtc,
-  @end_utc           = @endUtc,
-  @all_day           = 0,
-  @status            = 'confirmed',
-  @visibility        = 'private',
-  @created_by        = @alice,
-  @participants_json = @participants,
-  @reminders_json    = @reminders;
+IF NOT EXISTS (SELECT 1 FROM app.events WHERE title = N'Project Kickoff' AND calendar_id = @calAlice)
+BEGIN
+  EXEC app.sp_create_event
+    @calendar_id       = @calAlice,
+    @title             = N'Project Kickoff',
+    @description       = N'Initial meeting',
+    @location          = N'Meeting Room A',
+    @start_utc         = @startUtc,
+    @end_utc           = @endUtc,
+    @all_day           = 0,
+    @status            = 'confirmed',
+    @visibility        = 'private',
+    @created_by        = @alice,
+    @participants_json = @participants,
+    @reminders_json    = @reminders;
+END
 GO
+
+PRINT '✔ Scheduler DB setup complete.';
